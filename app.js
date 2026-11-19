@@ -2665,3 +2665,148 @@ document.addEventListener('keydown',e=>{if(e.key!=='Escape')return;const visible
 
 async function health(){try{await fetch(WORKER_URL)}catch{}}
 window.addEventListener('online',async()=>{updateOfflineNotice();await updateSyncUi();await syncQueue();await refreshRecords()});window.addEventListener('offline',()=>{updateOfflineNotice();updateSyncUi()});setupVisualViewport();health();restoreSession();openInvitationFromUrl();if('serviceWorker' in navigator)window.addEventListener('load',async()=>{try{const reg=await navigator.serviceWorker.register('./sw.js?v=500');try{await reg.update()}catch{};let reloading=false;navigator.serviceWorker.addEventListener('controllerchange',()=>{if(reloading)return;reloading=true;location.reload()})}catch(error){console.error('Service worker registration failed',error)}});
+
+/*
+PRS 5 — Telepen Alpha live scanner improvement
+Paste this entire block at the END of GitHub PRSAV/PRS5 app.js.
+DO NOT paste into Cloudflare worker.js.
+Based on app.js currently exposing patch14Mode, ensureZXingWasmEngine,
+ensureSythosEngine, sourceImageData, scannerRunning, scannerScanBusy,
+scannerAutoProceed, scannerFrameCount, handleScannerDecoded.
+*/
+(() => {
+  'use strict';
+  const originalNativeScannerClass = nativeScannerClass;
+  const originalScanOneLiveFrame = scanOneLiveFrame;
+  const originalStartScanner = startScanner;
+  const telepenMatches = new Map();
+  let lastMode = '';
+
+  // Native BarcodeDetector often has no Telepen Alpha implementation.
+  // In this mode, let existing ZXing WASM + Telepen-specific decoder initialize.
+  nativeScannerClass = function () {
+    return patch14Mode() === 'telepen' ? null : originalNativeScannerClass();
+  };
+
+  // On devices that allow it, request more detail for narrow Telepen bars.
+  // Failure is harmless: live camera continues at its existing resolution.
+  startScanner = async function (...args) {
+    const result = await originalStartScanner(...args);
+    if (patch14Mode() !== 'telepen' || !scannerRunning) return result;
+    const track = scannerStream?.getVideoTracks?.()[0];
+    if (!track || typeof track.applyConstraints !== 'function') return result;
+    try {
+      const supported = navigator.mediaDevices?.getSupportedConstraints?.() || {};
+      const opts = {};
+      if (supported.width) opts.width = { ideal: 1920 };
+      if (supported.height) opts.height = { ideal: 1080 };
+      if (Object.keys(opts).length) await track.applyConstraints(opts);
+    } catch (error) {
+      console.debug('Telepen camera resolution request unavailable:', error);
+    }
+    return result;
+  };
+
+  function telepenFrameCanvas(video, enhance = false) {
+    const vw = video.videoWidth || 0, vh = video.videoHeight || 0;
+    if (!vw || !vh) return null;
+    // Preserve almost all horizontal pixels AND the barcode quiet zones.
+    const sx = Math.floor(vw * 0.015), sw = vw - 2 * sx;
+    const sh = Math.floor(vh * 0.46), sy = Math.floor((vh - sh) / 2);
+    const maxW = 2600, scale = Math.min(1.7, maxW / sw);
+    const w = Math.round(sw * scale), h = Math.round(sh * scale);
+    const pad = 32;
+    const canvas = document.createElement('canvas');
+    canvas.width = w + pad * 2; canvas.height = h + pad * 2;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true, alpha: false });
+    if (!ctx) return null;
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.filter = enhance ? 'grayscale(1) contrast(1.45)' : 'none';
+    ctx.drawImage(video, sx, sy, sw, sh, pad, pad, w, h);
+    return canvas;
+  }
+
+  function validTelepenHit(hit) {
+    if (!hit || hit.isValid === false) return '';
+    const format = String(hit.format || hit.symbology || '').toLowerCase();
+    if (!format.includes('telepen')) return '';
+    const value = String(hit.text ?? hit.rawValue ?? '').replace(/\u0000/g, '').trim();
+    if (value.length < 2 || value.length > 200 || value.includes('\uFFFD')) return '';
+    if (/[\x00-\x08\x0b\x0e-\x1f\x7f]/.test(value)) return '';
+    return value;
+  }
+
+  async function decodeTelepenFrame(source) {
+    // ZXing-C++ decoder provides structurally checked Telepen values.
+    try {
+      const zx = await ensureZXingWasmEngine();
+      const hits = await zx.readBarcodes(sourceImageData(source, 3000), {
+        formats: ['Telepen'],
+        tryHarder: true, tryRotate: true, tryInvert: true,
+        tryDownscale: false, tryDenoise: false,
+        minLineCount: 1, maxNumberOfSymbols: 3, textMode: 'Plain'
+      });
+      for (const hit of hits || []) {
+        const value = validTelepenHit(hit);
+        if (value) return value;
+      }
+    } catch (error) { console.debug('Telepen ZXing pass:', error); }
+
+    // Separate Telepen-specific fallback; no OCR or visual guessing.
+    try {
+      const engine = await ensureSythosEngine();
+      const hits = engine.decode(sourceImageData(source, 3000), {
+        formats: ['telepen'], tryHarder: true, profile: 'camera'
+      });
+      for (const hit of hits || []) {
+        const value = validTelepenHit(hit);
+        if (value) return value;
+      }
+    } catch (error) { console.debug('Telepen fallback pass:', error); }
+    return '';
+  }
+
+  scanOneLiveFrame = async function () {
+    if (patch14Mode() !== 'telepen') {
+      if (lastMode === 'telepen') telepenMatches.clear();
+      lastMode = patch14Mode();
+      return originalScanOneLiveFrame();
+    }
+    if (!scannerRunning || scannerScanBusy || scannerAutoProceed) return;
+    const video = document.getElementById('prsMobileScanVideo');
+    if (!video || video.readyState < 2 || !video.videoWidth) return;
+    lastMode = 'telepen';
+    scannerScanBusy = true;
+    scannerFrameCount++;
+    const canvas = telepenFrameCanvas(video, scannerFrameCount % 3 === 0);
+    try {
+      if (!canvas) return;
+      const value = await decodeTelepenFrame(canvas);
+      const now = Date.now();
+      for (const [text, seen] of telepenMatches) {
+        if (now - seen.when > 3000) telepenMatches.delete(text);
+      }
+      if (value) {
+        const seen = telepenMatches.get(value);
+        const count = seen && now - seen.when <= 3000 ? seen.count + 1 : 1;
+        telepenMatches.set(value, { count, when: now });
+        // Same exact decoded text on two frames, to avoid accidental readings.
+        if (count >= 2) {
+          telepenMatches.clear();
+          handleScannerDecoded(value);  // Existing evidence/photo + form workflow.
+          return;
+        }
+      }
+      const status = document.getElementById('scanStatus');
+      if (status && scannerFrameCount % 8 === 0) {
+        status.textContent = 'Telepen Alpha scanning automatically… Keep the entire barcode and blank side margins visible. Hold still for focus.';
+      }
+    } catch (error) {
+      console.debug('PRS 5 Telepen live scan:', error);
+    } finally {
+      if (canvas) { canvas.width = 1; canvas.height = 1; }
+      scannerScanBusy = false;
+    }
+  };
+})();
+
