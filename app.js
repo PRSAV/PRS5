@@ -1820,7 +1820,7 @@ function patch14Choose(candidates,mode=patch14Mode()){
     const top=g.items[0];
     // A trusted structural decoder may stand alone. Permissive/custom fallbacks
     // must repeat the SAME full value on independent image passes.
-    const trusted=g.items.some(x=>x.engine==='ZXing-C++'||x.engine==='Sythos-camera'||String(x.engine||'').startsWith('PRS-Code11'));
+    const trusted=g.items.some(x=>x.engine==='ZXing-C++'||x.engine==='Browser-Code128'||x.engine==='Sythos-camera'||String(x.engine||'').startsWith('PRS-Code11'));
     const consensus=g.passes.size>=2||g.engines.size>=2;
     if(trusted||consensus){
       const best=[...g.items].sort((a,b)=>(b.strict-a.strict)||(b.confidence-a.confidence))[0];
@@ -1865,6 +1865,35 @@ async function patch14Sythos(source,mode,candidates,pass,{camera=true}={}){
     }
   }catch(error){console.debug('Patch14 Sythos pass failed',mode,pass,error)}
 }
+// PRS5 targeted Code-128 recovery: accept ordinary text, including spaces.
+// Use a native structural reader first, then Quagga2 with its Code-128
+// checksum. Unlike typed-code fallback this actually decodes barcode bars.
+async function prs5RecoverCode128(source,candidates,pass,mode){
+  if(mode!=='code128'&&mode!=='auto')return;
+  try{
+    const Native=typeof window.BarcodeDetector==='function'?window.BarcodeDetector:null;
+    if(Native){
+      const detector=new Native({formats:['code_128']});
+      const results=await detector.detect(source);
+      for(const hit of results||[]){
+        const value=patch14CleanText(hit.rawValue||'');
+        patch14AddCandidate(candidates,{value,format:'Code128',engine:'Browser-Code128',confidence:1,pass,strict:true,mode});
+      }
+    }
+  }catch(e){console.debug('Native Code 128 unavailable:',e)}
+  try{
+    const canvas=source instanceof HTMLCanvasElement?source:null;
+    if(!canvas)return;
+    const src=await canvasDataUrl(canvas);
+    // Quagga validates Code 128 structurally including its check symbol.
+    // Confirm untrusted third-party decodes on two independent image passes.
+    for(const locate of [true,false]){
+      const hit=await quaggaDecodeDataUrl(src,['code_128_reader'],{locate,patchSize:'large',timeoutMs:3500});
+      if(hit)patch14AddCandidate(candidates,{value:hit.rawValue,format:'Code128',engine:'Quagga-Code128',confidence:1,pass:pass+(locate?'-locate':'-direct'),strict:false,mode});
+    }
+  }catch(e){console.debug('Quagga Code 128 recovery unavailable:',e)}
+}
+
 async function patch14QuaggaPharmacode(source,candidates,pass,mode){
   if(mode!=='pharmacode1')return;
   try{
@@ -1911,6 +1940,11 @@ async function patch16DecodeFile(file,mode=patch14Mode()){
       const cfg=patch14Cfg(mode);
       if(cfg.zxing?.length)await patch14ZXing(file,mode,candidates,'fast-original');
       else if(cfg.sythos?.length)await patch14Sythos(item.img,mode,candidates,'fast-original',{camera:true});
+      if(mode==='code128'||mode==='auto'){
+        const original=document.createElement('canvas');original.width=item.img.naturalWidth||item.img.width;original.height=item.img.naturalHeight||item.img.height;
+        if(original.width&&original.height){original.getContext('2d')?.drawImage(item.img,0,0);await prs5RecoverCode128(original,candidates,'fast-original',mode)}
+        original.width=1;original.height=1;
+      }
       if(mode==='pharmacode2'||mode==='flattermarken')patch14Special(item.img,candidates,'fast-original',mode);
       chosen=patch14Choose(candidates,mode);if(chosen)return finish(chosen,1);
     }
@@ -1933,6 +1967,7 @@ async function patch16DecodeFile(file,mode=patch14Mode()){
         if(cfg.zxing?.length)await patch14ZXing(enhanced,mode,candidates,'fast-enhanced');
         chosen=patch14Choose(candidates,mode);if(chosen)return finish(chosen,2);
         if(cfg.sythos?.length)await patch14Sythos(enhanced,mode,candidates,'fast-enhanced',{camera:true});
+        if(mode==='code128'||mode==='auto')await prs5RecoverCode128(enhanced,candidates,'fast-enhanced',mode);
         if(mode==='pharmacode1')await patch14QuaggaPharmacode(enhanced,candidates,'fast-enhanced',mode);
         if(mode==='pharmacode2'||mode==='flattermarken')patch14Special(enhanced,candidates,'fast-enhanced',mode);
         chosen=patch14Choose(candidates,mode);if(chosen)return finish(chosen,2);
@@ -2089,23 +2124,14 @@ function openScanner(){
   scanCodes=[];scanEvidenceFiles=[];scannerAutoProceed=false;scannerFrameCount=0;
   $('manualScanCode').value='';renderScanCodes();$('qrReader').innerHTML='';
   $('scannerModal').classList.remove('hidden');
-  const mobile=isMobileBarcodeDevice();
   const startBtn=$('startScannerBtn');
   const captureLabel=$('iosScanCameraLabel');
-  if(mobile){
-    // Patch 14 deliberately uses the SAME still-photo barcode pipeline on iOS
-    // and Android. A still photo contains the full left/right quiet zones and
-    // prevents a live-frame decoder from accepting only the final digits.
-    ensureIOSScanCameraInput();
-    startBtn.hidden=true;
-    if(captureLabel){captureLabel.hidden=false;captureLabel.textContent='Open Camera & Scan'}
-    $('scanStatus').textContent='Version 4 fast linear scanner ready. Code-11 is native; decoding uses at most 2 passes.';
-    if(navigator.onLine&&patch14Mode()!=='code11')setTimeout(()=>ensureZXingWasmEngine().then(()=>console.debug('Patch16 ZXing warmed')).catch(()=>{}),0);
-  }else{
-    startBtn.hidden=false;startBtn.textContent='Start Camera';startBtn.disabled=false;
-    if(captureLabel)captureLabel.hidden=true;
-    $('scanStatus').textContent='Desktop live scanner ready. For difficult 1D codes, use Scan Image and select the exact Barcode Type.';
-  }
+  startBtn.hidden=false;startBtn.disabled=false;startBtn.textContent='Stop Camera';
+  if(captureLabel)captureLabel.hidden=true;
+  $('scanStatus').textContent='Opening live camera automatically… hold the complete barcode in front of it. No photo button needed.';
+  // getUserMedia begins directly inside the user-initiated Scan & Verify click.
+  // Modern iOS Safari supports this; on unsupported devices a still-photo fallback remains.
+  void startScanner();
 }
 
 function dataUrlToBlobForScanner(dataUrl){
@@ -2230,7 +2256,7 @@ async function scanOneLiveFrame(){
     if(!value&&scannerFrameCount%6===0){const contrastCrop=scannerCrop(video,true);if(contrastCrop)value=await detectWithScannerDetector(contrastCrop)}
     if(value){handleScannerDecoded(value);return}
     const elapsed=(Date.now()-scannerStartedAt)/1000;
-    if(scannerFrameCount%10===0&&!scannerAutoProceed)$('scanStatus').textContent=elapsed>8?'Camera is scanning continuously. Move the barcode closer so the bars fill most of the box width, but keep the blank left/right margins visible.':`Camera live • scanning… (${scannerFrameCount} frames analysed)`;
+    if(scannerFrameCount%10===0&&!scannerAutoProceed)$('scanStatus').textContent=elapsed>8?'Camera is scanning continuously. Move the barcode closer so the bars fill most of the box width, but keep the blank left/right margins visible.':`Live camera • automatic barcode scanning… (${scannerFrameCount} frames analysed)`;
   }catch(error){console.debug('Mobile barcode frame decode:',error?.name||error?.message||error)}finally{scannerScanBusy=false}
 }
 
@@ -2240,43 +2266,67 @@ function scheduleScannerLoop(delay=170){
 }
 
 async function startScanner(){
-  // IMPORTANT: iPhone uses native capture. This call remains fully synchronous
-  // until the picker is opened, preserving Safari's required user gesture.
-  if(isIOSDevice()){
-    startIOSNativeScanCamera();
+  if(scannerRunning){await stopScanner();return}
+  if(!window.isSecureContext){$('scanStatus').textContent='Camera requires HTTPS. Open https://prsav.github.io/PRS5/';return}
+  if(!navigator.mediaDevices?.getUserMedia){
+    $('scanStatus').textContent='Live camera is unavailable on this browser. Use Scan Image or Take Photo fallback.';
+    if(isIOSDevice()){const label=$('iosScanCameraLabel');if(label){ensureIOSScanCameraInput();label.hidden=false;label.textContent='Take Photo (fallback)'}}
     return;
   }
-  if(scannerRunning){await stopScanner();return}
-  if(!window.isSecureContext){$('scanStatus').textContent='Camera requires HTTPS. Open the PRS2 GitHub Pages website.';return}
-  if(!navigator.mediaDevices?.getUserMedia){$('scanStatus').textContent='Live camera is unavailable. Use Scan Image or enter the code manually.';return}
-  const button=$('startScannerBtn');button.disabled=true;button.textContent='Opening Camera…';$('scanStatus').textContent='Opening rear camera… allow Camera permission if prompted.';
+  const button=$('startScannerBtn');button.disabled=true;button.textContent='Opening Camera…';$('scanStatus').textContent='Opening rear camera automatically… allow Camera permission if prompted.';
   scannerAutoProceed=false;scannerScanBusy=false;scannerFrameCount=0;
   let stream;
   try{
     stopTracksSynchronously();clearTimeout(scannerLoopTimer);
     try{stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'}}})}
     catch(error){if(String(error?.name||'')==='OverconstrainedError')stream=await navigator.mediaDevices.getUserMedia({audio:false,video:true});else throw error}
+    if($('scannerModal').classList.contains('hidden')){
+      for(const track of stream.getTracks())try{track.stop()}catch{}
+      button.disabled=false;button.textContent='Start Camera';return;
+    }
     scannerStream=stream;
     const video=buildScannerVideo();video.srcObject=stream;video.muted=true;video.setAttribute('playsinline','');video.setAttribute('webkit-playsinline','');
     try{const p=video.play();p?.catch?.(()=>{})}catch{}
     await waitForVideoReady(video);tuneMobileCamera(video).catch(()=>{});
     scannerRunning=true;scannerStartedAt=Date.now();button.disabled=false;button.textContent='Stop Camera';$('scanStatus').textContent='Camera is live. Preparing barcode-first recognition…';
-    try{scannerDetector=await createScannerDetector()}catch(error){scannerDetector=null;console.error('Scanner decoder failed while camera stayed open:',error)}
+    // Prefer the browser's native live barcode reader (fast and low overhead).
+    // If unsupported, use the existing ZXing WASM + fallback decoder.
+    const native=nativeScannerClass();
+    if(native){
+      try{
+        const formats=typeof native.getSupportedFormats==='function' ? await native.getSupportedFormats() : [];
+        const preferred=['code_128','qr_code','ean_13','ean_8','code_39','code_93','itf','upc_a','upc_e','data_matrix','pdf417'];
+        const usable=Array.isArray(formats)&&formats.length ? preferred.filter(f=>formats.includes(f)) : preferred;
+        scannerDetector=new native(usable.length ? {formats:usable} : undefined);
+        scannerEngineSource='Native live barcode reader';
+      }catch(error){console.debug('Native live scanner unavailable:',error);scannerDetector=null}
+    }
+    if(!scannerDetector){
+      $('scanStatus').textContent='Camera is live. Loading barcode recognition…';
+      try{scannerDetector=await createScannerDetector()}catch(error){scannerDetector=null;console.error('Scanner decoder could not load:',error)}
+    }
     if(!scannerRunning)return;
-    if(!scannerDetector){$('scanStatus').textContent='Camera is live but automatic recognition could not load. Enter the code manually and tap Use Code(s) & Verify; the evidence photo will be captured from the live camera.';return}
-    $('scanStatus').textContent=`Barcode-first scanner is live${scannerEngineSource?` (${scannerEngineSource})`:''}. Hold the complete barcode steady inside the box and keep the blank margins on both sides visible.`;scheduleScannerLoop(180);
+    if(!scannerDetector){
+      $('scanStatus').textContent='Camera is live but the decoder could not load. Use Scan Image or enter the code and tap Use Code(s) & Verify.';
+      if(isIOSDevice()){ensureIOSScanCameraInput();const label=$('iosScanCameraLabel');if(label){label.hidden=false;label.textContent='Take Photo (fallback)'}}
+      return;
+    }
+    $('scanStatus').textContent=`Auto-scanning live${scannerEngineSource?` (${scannerEngineSource})`:''}. Hold the entire barcode steady within the frame. Verification opens automatically when decoded.`;
+    scheduleScannerLoop(80);
   }catch(error){
     console.error('Mobile scanner start failed:',error);scannerRunning=false;scannerScanBusy=false;scannerDetector=null;clearTimeout(scannerLoopTimer);scannerLoopTimer=null;
-    if(stream?.getTracks)for(const track of stream.getTracks())try{track.stop()}catch{};stopTracksSynchronously();$('qrReader').innerHTML='';button.disabled=false;button.textContent='Start Camera';$('scanStatus').textContent=`Camera scanner could not start. ${cameraErrorMessage(error)}`;
+    if(stream?.getTracks)for(const track of stream.getTracks())try{track.stop()}catch{};stopTracksSynchronously();$('qrReader').innerHTML='';button.disabled=false;button.textContent='Start Camera';$('scanStatus').textContent=`Live camera could not start. ${cameraErrorMessage(error)} Use Scan Image or Take Photo fallback.`;
+    if(isIOSDevice()){ensureIOSScanCameraInput();const label=$('iosScanCameraLabel');if(label){label.hidden=false;label.textContent='Take Photo (fallback)'}}
   }
 }
 
 async function stopScanner(options={}){
   const button=$('startScannerBtn');clearTimeout(scannerLoopTimer);scannerLoopTimer=null;scannerRunning=false;scannerScanBusy=false;scannerDetector=null;stopTracksSynchronously();
   if(scannerCanvas){try{scannerCanvas.width=1;scannerCanvas.height=1}catch{};scannerCanvas=null}
-  if(!isIOSDevice())$('qrReader').innerHTML='';
-  if(button){button.disabled=false;button.textContent=isIOSDevice()?'Open Camera & Scan':'Start Camera';button.hidden=isIOSDevice()}const iosLabel=$('iosScanCameraLabel');if(iosLabel){iosLabel.hidden=!isIOSDevice();if(isIOSDevice())iosLabel.textContent='Open Camera & Scan'}
-  if(!options.preserveStatus&&!$('scannerModal').classList.contains('hidden'))$('scanStatus').textContent=scanCodes.length?`${scanCodes.length} code${scanCodes.length===1?'':'s'} captured.`:(isIOSDevice()?'Tap Open Camera & Scan to capture the tag.':'Camera stopped. Tap Start Camera to scan again.');
+  $('qrReader').innerHTML='';
+  if(button){button.disabled=false;button.textContent='Start Camera';button.hidden=false}
+  const iosLabel=$('iosScanCameraLabel');if(iosLabel)iosLabel.hidden=true;
+  if(!options.preserveStatus&&!$('scannerModal').classList.contains('hidden'))$('scanStatus').textContent=scanCodes.length?`${scanCodes.length} code${scanCodes.length===1?'':'s'} captured.`:'Camera stopped. Tap Start Camera to resume live scanning.';
 }
 
 async function closeScanner(){
