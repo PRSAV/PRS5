@@ -1,0 +1,17 @@
+{
+  "name": "PRS.AssetVerify 5.0",
+  "short_name": "PRS Verify 5",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#eef4f8",
+  "theme_color": "#0067b8",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
